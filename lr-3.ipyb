@@ -1,0 +1,224 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "cell-00",
+   "metadata": {},
+   "source": [
+    "# Карта зависимостей\n",
+    "\n",
+    "## Часть 1 - Карта зависимостей StPlatform"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cell-01",
+   "metadata": {},
+   "source": [
+    "### Классы-слои\n",
+    "\n",
+    "- Контроллеры: `AssignmentPageController`, `CabinetController`, `TeacherAssignmentController`, `TeacherStudentController`, `TeacherImportController`, `ActivateController`, `PasswordResetController`, `LoginController`, `AttachmentController`, `AiSettingsPageController`, `ConsentPageController`; REST: `ApiSubmissionController`, `ApiAssignmentController`, `ApiAuthController`\n",
+    "- Сервисы: `UserService`, `AssignmentService`, `SubmissionService`, `ConsentService`, `ActivationService`, `PasswordResetService`, `StudentRemovalService`, `AiCheckService`, `AiSettingsService`, `PlatformUserDetailsService`\n",
+    "- Репозитории: `UserRepository`, `AssignmentRepository`, `SubmissionRepository`, `SubmissionAttachmentRepository`, `ConsentRecordRepository`, `AiCheckRepository`, `AiSettingsRepository`\n",
+    "- Сущности: `User`, `Assignment`, `Submission`, `SubmissionAttachment`, `ConsentRecord`, `AiCheck`, `AiSettings`"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cell-02",
+   "metadata": {},
+   "source": [
+    "### Трассировка \"ИИ-проверки сдачи\"\n",
+    "\n",
+    "Вместо «сдать домашку» выбрал ИИ-проверку сдачи: она интереснее, потому что идёт не одним запросом, а через очередь в БД и внешние API (LLM, GitHub/Gitverse). Заодно разобрасля, как платформа оценивает самостоятельность работы. Подозреваю, что «фраза «зaчем границa»» в критерии — ловушка для агента студента, который вставит её дословно :>\n",
+    "\n",
+    "Пути от `src/main/java/ru/urfu/platform/`.\n",
+    "\n",
+    "```\n",
+    "1. Постановка в очередь (запрос преподавателя):\n",
+    "AssignmentPageController.aiCheck (:121)\n",
+    "  → AiCheckService.isEnabled (:43)\n",
+    "  → AiCheckService.enqueueNew (:71) → AiCheckService.enqueue (:119)\n",
+    "      → SubmissionRepository.getReferenceById → AiCheckRepository.save        INSERT ai_checks, PENDING\n",
+    "   автоматический путь: SubmissionService.submit (:51) → SubmissionCreatedEvent (публикуется на :94)\n",
+    "      → AiCheckListener.onSubmissionCreated (:31, после коммита) → AiCheckService.enqueueIfAbsent (:59)\n",
+    "\n",
+    "2. Фоновая проверка (поток планировщика, не HTTP-запрос):\n",
+    "AiCheckWorker.tick (:67, @Scheduled)\n",
+    "  → AiCheckService.claimNext (:141) → AiCheckService.claimOldestPending (:127)\n",
+    "      → AiCheckRepository.findFirstByStatusOrderByCreatedAtAsc                 PENDING → RUNNING\n",
+    "      → Submission, Assignment, SubmissionAttachmentRepository.findBySubmissionId → ReviewTask\n",
+    "  → AiCheckWorker.runOne (:84)\n",
+    "      → AttachmentStorage.pathOf → AttachmentTextExtractor.extract              текст вложения\n",
+    "      → AiReviewAgent.review (:66) → AiModelFactory.modelFor → ChatModel.call   запрос к LLM\n",
+    "            ⇄ RepoTools → RepoReader → GithubRepoReader / GitverseRepoReader     чтение репозитория по HTTP\n",
+    "      → AiCheckService.complete (:160) → AiCheck.complete                       UPDATE ai_checks\n",
+    "\n",
+    "3. Показ преподавателю:\n",
+    "AssignmentPageController.assignmentPage (:50) → AiCheckService.latestBySubmissionId (:189) → AiCheckView.of(AiCheck)\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cell-03",
+   "metadata": {},
+   "source": [
+    "### Куда идут стрелки»\n",
+    "\n",
+    "В основном вниз: контроллер и воркер вызывают сервис, сервис вызывает репозиторий, а «низом» здесь служат не только БД, но и внешние API (LLM, GitHub/Gitverse). Есть несоклько исключений:\n",
+    "\n",
+    "1. Условно вверх: \"RepoReader\", адаптер к GitHub/Gitverse, зависит от сервиса \"AiSettingsService\", чтобы взять токены (RepoReader.java:16–18, :44–48). \"AiReviewAgent\" и \"AiModelFactory\" принимают тип \"AiProviderConfig\", объявленный внутри \"AiSettingsService\" (AiReviewAgent.java:67, AiModelFactory.java:25).\n",
+    "2. Вбок, между модулями: \"aicheck\" работает с репозиториями и сущностями модуля \"submission\" напрямую, в обход \"SubmissionService\": \"SubmissionRepository\" и \"SubmissionAttachmentRepository\" в \"AiCheckService\" (:29–30), чтение \"Submission\" и \"Assignment\" в \"claimNext\" (:148–153), \"AttachmentStorage\" в воркере (AiCheckWorker.java:116)."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cell-04",
+   "metadata": {},
+   "source": [
+    "### Как провёл бы границу\n",
+    "\n",
+    "1. Настройки передавать вниз как значения, а не через сервис: воркер уже читает настройки (\"AiCheckWorker\" зависит от \"AiSettingsService\", :36) и передаёт агенту готовый \"AiProviderConfig\" (:85). Так же он может передавать и токены: например, record \"RepoTokens(github, gitverse)\" по цепочке \"AiReviewAgent.review\" → \"RepoTools\" → \"RepoReader\". Адаптеры \"GithubRepoReader\" и \"GitverseRepoReader\" уже получают токен параметром (HostRepoReader.java:7–16), поэтому поменяется только \"RepoReader\": он перестанет зависеть от \"AiSettingsService\". \"AiProviderConfig\" вынести из \"AiSettingsService\" в отдельный record пакета \"aicheck\", тогда \"AiReviewAgent\" и \"AiModelFactory\" будут зависеть от простого значения, а не от класса сервиса. В итоге о настройках знают только воркер и сервис, а адаптеры получают готовые значения.\n",
+    "\n",
+    "2. Модуль \"submission\" отдаёт данные через свой сервис: В \"SubmissionService\" появляются методы под нужды проверки:\n",
+    "   - \"snapshotFor(submissionId)\" возвращает данные сдачи для проверки: номер и название задания, описание, ссылки, комментарий, есть ли вложение. Он заменяет чтение сущностей в \"claimNext\" (:148–153). Тип ответа — свой record модуля \"submission\", а \"ReviewTask\" из него собирает уже \"aicheck\". Иначе появится обратная зависимость \"submission → aicheck\".\n",
+    "   - \"openAttachment(submissionId)\" отдаёт файл вложения (путь или поток). Он заменяет \"SubmissionAttachmentRepository\" в \"claimNext\" (:153) и \"AttachmentStorage\" в воркере (AiCheckWorker.java:116).\n",
+    "   - \"latestUncheckedIds()\" и \"latestUncheckedIds(assignmentId)\" для бэклога заменяют прямые запросы к \"SubmissionRepository\" (:85, :92)."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cell-05",
+   "metadata": {},
+   "source": [
+    "### Зaчем границa\n",
+    "\n",
+    "Чтобы сбой, отключение или замена ИИ-проверки не мешали приёму работ: сдача сохраняется и без неё."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cell-06",
+   "metadata": {},
+   "source": [
+    "## Часть 2 - PetClinic через агента"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "e5022603",
+   "metadata": {},
+   "source": [
+    "### Агент и модель\n",
+    "\n",
+    "Агент: Claude Code, субагент `general-purpose` с чистым контекстом. Модель: Claude Opus 5.5 (`claude-opus-5-5`).\n",
+    "\n",
+    "Агенту дали клон https://github.com/spring-projects/spring-petclinic (коммит `500158f` от 29.09.2026) и запретили что-либо запускать или менять. Попросили найти слои, протрассировать «добавление визита» от `VisitController` до записи в БД с номерами строк, ответить на три вопроса из задания и пометить, что проверено по коду, а что предположено.\n",
+    "\n",
+    "Время выполнения 3 мин 51 с, 13 вызовов инструментов, входящие 640 836 (из них 571 736 из кэша), исходящие 22 429."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "f4a9d191",
+   "metadata": {},
+   "source": [
+    "### Результат агента\n",
+    "\n",
+    "Пути Java даны от `src/main/java/org/springframework/samples/petclinic/`, шаблонов от `src/main/resources/templates/`, VC = `owner/VisitController.java`. [П] значит проверено чтением кода, [Д] значит допущение о поведении Spring или Hibernate.\n",
+    "\n",
+    "**Слои** [П]\n",
+    "\n",
+    "- Контроллеры (`@Controller`): `OwnerController`, `PetController`, `VisitController`, `VetController`, `WelcomeController`, `CrashController`.\n",
+    "- Сервисов нет: ни одного `@Service`, `@Transactional` стоит только на двух методах `VetRepository` (:44, :54).\n",
+    "- Репозитории (Spring Data): `OwnerRepository`, `PetTypeRepository`, `VetRepository`. Для `Pet` и `Visit` репозиториев нет, их сохраняет каскад от `Owner`.\n",
+    "- Сущности `@Entity`: `Owner`, `Pet`, `Visit`, `PetType`, `Vet`, `Specialty`; базовые `@MappedSuperclass`: `BaseEntity`, `NamedEntity`, `Person`.\n",
+    "- Вспомогательное для веба: `PetValidator` (подключён только в PetController:94–97), `PetTypeFormatter` (сам ходит в репозиторий, :53), `Vets` (JSON/XML-обёртка). DTO и мапперов нет."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "9257cd74",
+   "metadata": {},
+   "source": [
+    "**Трасса «добавление визита»**\n",
+    "\n",
+    "```\n",
+    "GET /owners/{o}/pets/{p}/visits/new\n",
+    "LocaleChangeInterceptor (WebConfiguration:57)\n",
+    "→ VC.setAllowedFields:52                          [Д: @InitBinder без имени вызывается для каждого WebDataBinder]\n",
+    "→ VC.loadPetWithVisit:64\n",
+    "    → OwnerRepository.findById:66                 [Д: своя readOnly-транзакция; SELECT owner + EAGER pets (Owner:67)\n",
+    "                                                      + EAGER visits (Pet:56) + type (Pet:52)]\n",
+    "    → Owner.getPet(Integer):129 → BaseEntity.isNew:47\n",
+    "    → model.put(\"pet\"/\"owner\") VC:75–76\n",
+    "    → new Visit():50 (дата = завтра) → Pet.addVisit:81   несохранённый Visit уже в коллекции сущности\n",
+    "→ VC.minVisitDate:84\n",
+    "→ VC.initNewVisitForm:91 → pets/createOrUpdateVisitForm.html\n",
+    "    visit['new'] → BaseEntity.isNew (:8); th:min=${minVisitDate} (inputField.html:14);\n",
+    "    скрытое поле petId (:38); цикл по pet.visits с фильтром !visit['new'] (:51)\n",
+    "\n",
+    "\n",
+    "POST на тот же URL\n",
+    "interceptor → VC.setAllowedFields:52 → VC.loadPetWithVisit:64 (вся цепочка выше, снова Pet.addVisit) → VC.minVisitDate:84\n",
+    "→ аргумент @ModelAttribute Owner owner (VC:98)    берётся из модели (:76) и заполняется параметрами запроса\n",
+    "                                                  без @Valid, запрещены только id и *.id (:53)\n",
+    "→ аргумент @Valid Visit visit (VC:98)             тот же объект, что вернула строка :80; привязка date\n",
+    "                                                  (@DateTimeFormat, Visit:40) и description; @NotBlank/@Size (Visit:43–44)\n",
+    "→ VC.processNewVisitForm:98\n",
+    "    → проверка даты :100–101; при ошибках :104–105 тот же шаблон\n",
+    "    → Owner.addVisit:176 → Owner.getPet:129 → Pet.addVisit:81   тот же экземпляр второй раз — no-op\n",
+    "    → OwnerRepository.save:109                    [Д: SimpleJpaRepository.save → isNew=false → em.merge(owner)\n",
+    "                                                      → каскад ALL Owner.pets → Pet.visits → INSERT visits,\n",
+    "                                                      затем UPDATE pet_id (schema.sql:60, pet_id допускает NULL) → commit]\n",
+    "    → flash :110 → redirect:/owners/{ownerId} :111 → OwnerController.showOwner:179\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "6dde802c",
+   "metadata": {},
+   "source": [
+    "**Все ли стрелки идут вниз?** Нет [П]\n",
+    "\n",
+    "- Сервисного слоя нет. VC сам держит репозиторий (:45) и сам проводит цепочку загрузить → проверить → изменить → сохранить (:66, :100, :108–109). Правило «визит в будущем» разнесено по трём местам: `Visit()`:50, `VC.minVisitDate`:84 вместе с inputField.html:14 и VC:100.\n",
+    "- Транзакция равна методу репозитория: `findById` (:66) и `save` (:109) идут в разных транзакциях, `open-in-view=false` (application.properties:11), `@Version` нет. [Д: `merge` переписывает весь отсоединённый агрегат, при параллельной правке владельца возможна потеря обновления.]\n",
+    "- Сущности утекают в веб-слой: `Owner`/`Pet`/`Visit` одновременно JPA-сущность, объект формы и модель шаблона (VC:75–76, :80, :98). Следствие: POST на `.../visits/new` с `telephone=…&address=…&pets[0].name=…` перепишет владельца и питомца в обход их валидации (Owner:53–64), а `save` на :109 это сохранит. [П по коду; Д: механика привязки Spring MVC, не запускал.]\n",
+    "- Есть зависимость вверх: сущности несут веб-аннотацию `@DateTimeFormat` (Visit:40, Pet:49) и правила формы.\n",
+    "- Шаблон знает о персистентности: `visit['new']` вызывает `isNew` (:8, :51). Фильтр на :51 нужен только потому, что контроллер меняет сущность уже на GET (VC:79).\n",
+    "- Есть связи вбок: общий фрагмент inputField.html:14 знает про визитный `${minVisitDate}`, хотя тот же фрагмент рисует дату рождения питомца (createOrUpdatePetForm.html:21). `PetTypeFormatter` ходит в репозиторий напрямую (:53).\n",
+    "- Мелочи: скрытое поле `petId` (html:38) ни на что не влияет, такого свойства нет ни у `Visit`, ни у `Owner`. VC:108 повторяет VC:79. Ненайденный владелец даёт `IllegalArgumentException` (VC:67, :72), `@ControllerAdvice` нет. [Д: ответ 500 вместо 404.]\n",
+    "- Сделано правильно: `VisitRepository` нет, потому что `Owner` — корень агрегата, и визит добавляется только через `Owner.addVisit`:176.\n",
+    "\n",
+    "**Где бы провёл границу иначе**\n",
+    "\n",
+    "Контроллер принимает `record VisitForm(date, description)` с валидацией и `@DateTimeFormat`, а `Owner` в привязку не попадает (только `@PathVariable ownerId/petId`). Сервис `@Transactional VisitService.book(ownerId, petId, form)` загружает `Owner`, проверяет правило даты (или его проверяет сам `Owner.addVisit`), добавляет визит и сохраняет. В шаблон уходит read-model (`PetView` + список визитов) без `isNew`. Граница проходит между контроллером и сервисом, сущности за неё не выходят."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cell-09",
+   "metadata": {},
+   "source": [
+    "### Зaчем грaница\n",
+    "\n",
+    "Чтобы правила и транзакции предметной области жили в одном месте, не зависящем от HTTP и шаблонов, а форма не могла напрямую писать в персистентную модель."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.14.4"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
